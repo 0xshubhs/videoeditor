@@ -7,11 +7,11 @@ import { RESOLUTION_MAP } from '$lib/types/export.js';
 /**
  * Export the timeline to a video file.
  *
- * Strategy (memory-efficient):
- * 1. Single clip, no effects → stream copy trim (fastest, ~0 memory overhead)
- * 2. Multi-clip, no effects → trim each clip individually with stream copy,
- *    then concat demuxer (fast, processes one file at a time)
- * 3. Effects needed → filter_complex re-encode (slow, high memory)
+ * Strategies:
+ * A) Stream copy         — no effects, source resolution matches target → instant
+ * B) Re-encode per-clip  — resolution change needed (e.g. 4K), no cross-clip effects
+ *                          Processes ONE file at a time → low memory
+ * C) filter_complex      — text overlays or transitions → full re-encode (high memory)
  */
 export async function exportTimeline(
 	ffmpeg: FFmpegBridge,
@@ -47,17 +47,40 @@ export async function exportTimeline(
 	const hasEffects = textOverlays.length > 0 || transitions.length > 0;
 	const outputFile = `output.${config.format}`;
 
+	const targetRes = RESOLUTION_MAP[config.resolution];
+	const targetWidth = config.customWidth ?? targetRes.width;
+	const targetHeight = config.customHeight ?? targetRes.height;
+
+	// Probe source resolution to decide if scaling is needed
+	let needsScale = false;
+	if (!hasEffects) {
+		const firstAsset = getAssetFile(sortedClips[0].assetId);
+		if (firstAsset) {
+			const sourceRes = await probeVideoResolution(firstAsset.file);
+			if (sourceRes.width > 0 && sourceRes.height > 0) {
+				needsScale = sourceRes.width !== targetWidth || sourceRes.height !== targetHeight;
+			}
+		}
+	}
+
 	let blob: Blob;
 
-	if (sortedClips.length === 1 && !hasEffects) {
-		// Strategy 1: Single clip — stream copy trim
-		blob = await exportSingleClip(ffmpeg, sortedClips[0], config, outputFile, getAssetFile, progress);
-	} else if (!hasEffects) {
-		// Strategy 2: Multi-clip, no effects — trim each + concat (memory-efficient)
+	if (hasEffects) {
+		// Strategy C: filter_complex — text overlays or transitions need all clips
+		blob = await exportFilterComplex(
+			ffmpeg, sortedClips, textOverlays, config, targetWidth, targetHeight, outputFile, getAssetFile, progress
+		);
+	} else if (!needsScale && sortedClips.length === 1) {
+		// Strategy A: Single clip, source resolution — stream copy
+		blob = await exportSingleClipStreamCopy(ffmpeg, sortedClips[0], config, outputFile, getAssetFile, progress);
+	} else if (!needsScale) {
+		// Strategy A: Multi-clip, source resolution — stream copy concat
 		blob = await exportConcatStreamCopy(ffmpeg, sortedClips, config, outputFile, getAssetFile, progress);
 	} else {
-		// Strategy 3: Effects — filter_complex re-encode
-		blob = await exportFilterComplex(ffmpeg, sortedClips, textOverlays, config, outputFile, getAssetFile, progress);
+		// Strategy B: Resolution change (4K, downscale, etc.) — re-encode per-clip + concat
+		blob = await exportReencodeConcat(
+			ffmpeg, sortedClips, config, targetWidth, targetHeight, outputFile, getAssetFile, progress
+		);
 	}
 
 	onProgress({
@@ -73,9 +96,38 @@ export async function exportTimeline(
 	return blob;
 }
 
-// ── Strategy 1: Single clip stream copy ─────────────────────────────
+// ── Probe source resolution (no WASM needed) ───────────────────────
 
-async function exportSingleClip(
+function probeVideoResolution(file: File): Promise<{ width: number; height: number }> {
+	return new Promise((resolve) => {
+		const url = URL.createObjectURL(file);
+		const video = document.createElement('video');
+		video.preload = 'metadata';
+
+		const timer = setTimeout(() => {
+			URL.revokeObjectURL(url);
+			resolve({ width: 0, height: 0 });
+		}, 5000);
+
+		video.onloadedmetadata = () => {
+			clearTimeout(timer);
+			resolve({ width: video.videoWidth, height: video.videoHeight });
+			URL.revokeObjectURL(url);
+		};
+
+		video.onerror = () => {
+			clearTimeout(timer);
+			resolve({ width: 0, height: 0 });
+			URL.revokeObjectURL(url);
+		};
+
+		video.src = url;
+	});
+}
+
+// ── Strategy A1: Single clip stream copy ────────────────────────────
+
+async function exportSingleClipStreamCopy(
 	ffmpeg: FFmpegBridge,
 	clip: Clip,
 	config: ExportConfig,
@@ -86,6 +138,8 @@ async function exportSingleClip(
 	const asset = getAssetFile(clip.assetId);
 	if (!asset) throw new Error(`Asset not found for clip "${clip.name}"`);
 
+	validateFileSize(asset.file.size);
+
 	const ext = getExt(asset.name);
 	const inputPath = `input.${ext}`;
 
@@ -94,7 +148,6 @@ async function exportSingleClip(
 
 	progress('rendering', 0.3);
 
-	// -ss before -i = fast input seeking
 	const args: string[] = [];
 	if (clip.sourceStart > 0.01) {
 		args.push('-ss', String(clip.sourceStart));
@@ -118,9 +171,7 @@ async function exportSingleClip(
 	return blob;
 }
 
-// ── Strategy 2: Multi-clip concat with stream copy ──────────────────
-// Processes ONE source file at a time to minimize memory usage.
-// Each clip is trimmed independently, then all trimmed files are concatenated.
+// ── Strategy A2: Multi-clip concat with stream copy ─────────────────
 
 async function exportConcatStreamCopy(
 	ffmpeg: FFmpegBridge,
@@ -133,11 +184,12 @@ async function exportConcatStreamCopy(
 	const trimmedFiles: string[] = [];
 	const total = sortedClips.length;
 
-	// Step 1: Trim each clip individually (one source file at a time)
 	for (let i = 0; i < total; i++) {
 		const clip = sortedClips[i];
 		const asset = getAssetFile(clip.assetId);
 		if (!asset) throw new Error(`Asset not found for clip "${clip.name}"`);
+
+		validateFileSize(asset.file.size);
 
 		const ext = getExt(asset.name);
 		const inputPath = `src_${i}.${ext}`;
@@ -145,10 +197,8 @@ async function exportConcatStreamCopy(
 
 		progress('preparing', (i / total) * 0.4);
 
-		// Write source file
 		await writeAssetFile(ffmpeg, inputPath, asset.file);
 
-		// Trim with stream copy (fast, no re-encode)
 		const args: string[] = [];
 		if (clip.sourceStart > 0.01) {
 			args.push('-ss', String(clip.sourceStart));
@@ -166,33 +216,24 @@ async function exportConcatStreamCopy(
 			throw new Error(`FFmpeg trim failed for clip ${i + 1} (exit code ${exitCode})`);
 		}
 
-		// Delete source file immediately to free memory
 		try { await ffmpeg.deleteFile(inputPath); } catch {}
-
 		trimmedFiles.push(trimmedPath);
 	}
 
 	progress('rendering', 0.5);
 
-	// Step 2: Create concat list
 	const concatList = trimmedFiles.map((f) => `file '${f}'`).join('\n');
 	const listPath = 'concat_list.txt';
-	const encoder = new TextEncoder();
-	await ffmpeg.writeFile(listPath, encoder.encode(concatList).buffer);
+	await ffmpeg.writeFile(listPath, new TextEncoder().encode(concatList).buffer);
 
-	// Step 3: Concat with stream copy
 	const concatArgs = [
-		'-f', 'concat',
-		'-safe', '0',
-		'-i', listPath,
-		'-c:v', 'copy',
-		'-c:a', 'copy',
+		'-f', 'concat', '-safe', '0', '-i', listPath,
+		'-c:v', 'copy', '-c:a', 'copy',
 		'-movflags', '+faststart',
 		'-y', outputFile,
 	];
 
 	progress('encoding', 0.6);
-
 	const exitCode = await ffmpeg.exec(concatArgs);
 	if (exitCode !== 0) {
 		await cleanup(ffmpeg, [...trimmedFiles, listPath, outputFile]);
@@ -200,27 +241,137 @@ async function exportConcatStreamCopy(
 	}
 
 	progress('finalizing', 0.9);
-
 	const blob = await readOutputBlob(ffmpeg, outputFile, config.format);
 	await cleanup(ffmpeg, [...trimmedFiles, listPath, outputFile]);
 	return blob;
 }
 
-// ── Strategy 3: filter_complex for effects ──────────────────────────
+// ── Strategy B: Re-encode per-clip + concat (4K, resolution change) ─
+// Processes ONE source file at a time → keeps WASM memory low.
+// Each clip is individually re-encoded to the target resolution,
+// then all re-encoded clips are concatenated with stream copy.
+
+async function exportReencodeConcat(
+	ffmpeg: FFmpegBridge,
+	sortedClips: Clip[],
+	config: ExportConfig,
+	width: number,
+	height: number,
+	outputFile: string,
+	getAssetFile: (id: string) => { file: File; name: string } | undefined,
+	progress: (stage: ExportProgress['stage'], p: number) => void
+): Promise<Blob> {
+	const encodedFiles: string[] = [];
+	const total = sortedClips.length;
+
+	for (let i = 0; i < total; i++) {
+		const clip = sortedClips[i];
+		const asset = getAssetFile(clip.assetId);
+		if (!asset) throw new Error(`Asset not found for clip "${clip.name}"`);
+
+		validateFileSize(asset.file.size);
+
+		const ext = getExt(asset.name);
+		const inputPath = `src_${i}.${ext}`;
+		const encodedPath = `enc_${i}.mp4`;
+
+		progress('preparing', (i / total) * 0.3);
+		await writeAssetFile(ffmpeg, inputPath, asset.file);
+
+		progress('encoding', 0.3 + (i / total) * 0.5);
+
+		const args: string[] = [];
+		if (clip.sourceStart > 0.01) {
+			args.push('-ss', String(clip.sourceStart));
+		}
+		args.push('-i', inputPath);
+		args.push('-t', String(clip.duration));
+
+		// Scale to target resolution with letterbox padding
+		args.push(
+			'-vf',
+			`scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`
+		);
+
+		args.push('-c:v', config.videoCodec);
+		args.push('-preset', 'ultrafast'); // Minimize memory + speed
+		args.push('-c:a', config.audioCodec);
+
+		if (config.videoBitrate > 0) {
+			args.push('-b:v', `${config.videoBitrate}k`);
+		}
+		if (config.audioBitrate > 0) {
+			args.push('-b:a', `${config.audioBitrate}k`);
+		}
+
+		args.push('-r', String(config.fps));
+		args.push('-threads', '1'); // Minimize peak memory
+		args.push('-movflags', '+faststart');
+		args.push('-y', encodedPath);
+
+		const exitCode = await ffmpeg.exec(args, {
+			onProgress: (p) => {
+				progress('encoding', 0.3 + ((i + p) / total) * 0.5);
+			},
+		});
+
+		if (exitCode !== 0) {
+			await cleanup(ffmpeg, [inputPath, encodedPath, ...encodedFiles, outputFile]);
+			throw new Error(`FFmpeg re-encode failed for clip ${i + 1} (exit code ${exitCode})`);
+		}
+
+		// Free source file immediately to reclaim WASM memory
+		try { await ffmpeg.deleteFile(inputPath); } catch {}
+		encodedFiles.push(encodedPath);
+	}
+
+	// Single encoded clip — just read it directly
+	if (encodedFiles.length === 1) {
+		progress('finalizing', 0.9);
+		const blob = await readOutputBlob(ffmpeg, encodedFiles[0], config.format);
+		await cleanup(ffmpeg, encodedFiles);
+		return blob;
+	}
+
+	// Multiple encoded clips — concat with stream copy (all same resolution now)
+	progress('rendering', 0.85);
+
+	const concatList = encodedFiles.map((f) => `file '${f}'`).join('\n');
+	const listPath = 'concat_list.txt';
+	await ffmpeg.writeFile(listPath, new TextEncoder().encode(concatList).buffer);
+
+	const concatArgs = [
+		'-f', 'concat', '-safe', '0', '-i', listPath,
+		'-c:v', 'copy', '-c:a', 'copy',
+		'-movflags', '+faststart',
+		'-y', outputFile,
+	];
+
+	const exitCode = await ffmpeg.exec(concatArgs);
+	if (exitCode !== 0) {
+		await cleanup(ffmpeg, [...encodedFiles, listPath, outputFile]);
+		throw new Error(`FFmpeg concat failed (exit code ${exitCode})`);
+	}
+
+	progress('finalizing', 0.95);
+	const blob = await readOutputBlob(ffmpeg, outputFile, config.format);
+	await cleanup(ffmpeg, [...encodedFiles, listPath, outputFile]);
+	return blob;
+}
+
+// ── Strategy C: filter_complex for effects ──────────────────────────
 
 async function exportFilterComplex(
 	ffmpeg: FFmpegBridge,
 	sortedClips: Clip[],
 	textOverlays: TextOverlay[],
 	config: ExportConfig,
+	width: number,
+	height: number,
 	outputFile: string,
 	getAssetFile: (id: string) => { file: File; name: string } | undefined,
 	progress: (stage: ExportProgress['stage'], p: number) => void
 ): Promise<Blob> {
-	const resolution = RESOLUTION_MAP[config.resolution];
-	const width = config.customWidth ?? resolution.width;
-	const height = config.customHeight ?? resolution.height;
-
 	// Write all source files (dedup by assetId)
 	const inputPaths: string[] = [];
 	const writtenAssets = new Map<string, string>();
@@ -235,6 +386,8 @@ async function exportFilterComplex(
 
 		const asset = getAssetFile(clip.assetId);
 		if (!asset) throw new Error(`Asset not found for clip "${clip.name}"`);
+
+		validateFileSize(asset.file.size);
 
 		const ext = getExt(asset.name);
 		const inputPath = `input_${i}.${ext}`;
@@ -260,19 +413,16 @@ async function exportFilterComplex(
 		const vLabel = `v${i}`;
 		const aLabel = `a${i}`;
 
-		// Video: trim + scale
 		filterParts.push(
 			`[${i}:v]trim=start=${clip.sourceStart}:duration=${clip.duration},setpts=PTS-STARTPTS,scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2[${vLabel}]`
 		);
 
-		// Audio: use real audio if available, generate silence as fallback
 		const vol = clip.muted ? 0 : clip.volume;
 		filterParts.push(
 			`[${i}:a]atrim=start=${clip.sourceStart}:duration=${clip.duration},asetpts=PTS-STARTPTS,volume=${vol}[${aLabel}]`
 		);
 	}
 
-	// Concat
 	if (sortedClips.length > 1) {
 		const streams = sortedClips.map((_, i) => `[v${i}][a${i}]`).join('');
 		filterParts.push(
@@ -283,7 +433,6 @@ async function exportFilterComplex(
 		filterParts.push(`[a0]acopy[outa]`);
 	}
 
-	// Text overlays
 	let videoOut = 'outv';
 	for (let i = 0; i < textOverlays.length; i++) {
 		const t = textOverlays[i];
@@ -299,6 +448,7 @@ async function exportFilterComplex(
 	args.push('-map', `[${videoOut}]`);
 	args.push('-map', '[outa]');
 	args.push('-c:v', config.videoCodec);
+	args.push('-preset', 'ultrafast'); // Memory-efficient
 	args.push('-c:a', config.audioCodec);
 
 	if (config.videoBitrate > 0) {
@@ -309,6 +459,7 @@ async function exportFilterComplex(
 	}
 
 	args.push('-r', String(config.fps));
+	args.push('-threads', '1'); // Minimize peak memory
 	args.push('-movflags', '+faststart');
 	args.push('-y', outputFile);
 
@@ -334,6 +485,20 @@ async function exportFilterComplex(
 }
 
 // ── Shared helpers ──────────────────────────────────────────────────
+
+/** Max file size FFmpeg.wasm can handle (WASM memory limit ~512MB, need room for processing) */
+const MAX_FILE_SIZE_MB = 300;
+
+function validateFileSize(bytes: number): void {
+	const mb = bytes / (1024 * 1024);
+	if (mb > MAX_FILE_SIZE_MB) {
+		throw new Error(
+			`File is too large (${Math.round(mb)}MB). ` +
+			`FFmpeg.wasm can handle files up to ~${MAX_FILE_SIZE_MB}MB. ` +
+			`Try trimming the clip shorter before exporting.`
+		);
+	}
+}
 
 function getExt(filename: string): string {
 	return filename.split('.').pop()?.toLowerCase() || 'mp4';
